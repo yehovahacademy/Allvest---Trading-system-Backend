@@ -53,12 +53,21 @@ def get_market_quote(symbol: str) -> StockQuote:
             detail="Market data provider rejected the request.",
         )
 
-    if "Note" in data or "Information" in data:
+    if "Note" in data:
+        print("Alpha Vantage rate limit notice:", data["Note"])
         raise HTTPException(
-            status_code=503,
-            detail="Market data is temporarily unavailable due to provider limits.",
+            status_code=429,
+            detail="Market data provider rate limit exceeded.",
         )
 
+    if "Information" in data:
+        print("Alpha Vantage unexpected response structure:", data["Information"])
+        raise HTTPException(
+            status_code=502,
+            detail="Market data provider returned unexpected information.",
+        )
+        
+    
     quote_data = data.get("Global Quote", {})
 
     if not quote_data:
