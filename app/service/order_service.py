@@ -13,7 +13,7 @@ from app.service.market_data_service import get_market_quote
 logger = logging.getLogger(__name__)
 
 
-def place_order(order: OrderCreate):
+def place_order(order: OrderCreate, user_id: int):
     symbol = order.symbol.strip().upper()
     quantity = order.quantity
 
@@ -56,10 +56,26 @@ def place_order(order: OrderCreate):
         with get_connection() as conn:
             with conn.cursor() as cur:
 
+                # Serialize trades for the same user and stock.
+                # This also protects the first BUY when no holding
+                # row exists yet.
+                cur.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtext(%s),
+                        hashtext(%s)
+                    )
+                    """,
+                    (
+                        f"trading-user:{user_id}",
+                        f"stock:{symbol}",
+                    ),
+                )
+
                 # Validate user.
                 cur.execute(
                     "SELECT id FROM users WHERE id = %s",
-                    (order.user_id,),
+                    (user_id,),
                 )
                 if cur.fetchone() is None:
                     raise HTTPException(
@@ -82,7 +98,8 @@ def place_order(order: OrderCreate):
                         detail="Stock not found.",
                     )
 
-                # Retrieve and lock an existing holding.
+                # Retrieve and lock the holding after acquiring
+                # the advisory lock.
                 cur.execute(
                     """
                     SELECT quantity, average_buy_price
@@ -90,7 +107,7 @@ def place_order(order: OrderCreate):
                     WHERE user_id = %s AND symbol = %s
                     FOR UPDATE
                     """,
-                    (order.user_id, symbol),
+                    (user_id, symbol),
                 )
                 holding = cur.fetchone()
 
@@ -119,7 +136,7 @@ def place_order(order: OrderCreate):
                         status, created_at
                     """,
                     (
-                        order.user_id,
+                        user_id,
                         symbol,
                         order.side,
                         quantity,
@@ -159,7 +176,7 @@ def place_order(order: OrderCreate):
                             updated_at = NOW()
                         """,
                         (
-                            order.user_id,
+                            user_id,
                             symbol,
                             new_quantity,
                             new_average,
@@ -182,7 +199,7 @@ def place_order(order: OrderCreate):
                         (
                             remaining,
                             old_average if remaining > 0 else Decimal("0"),
-                            order.user_id,
+                            user_id,
                             symbol,
                         ),
                     )
@@ -195,19 +212,17 @@ def place_order(order: OrderCreate):
         raise
 
     except psycopg.Error as exc:
-        # Log the technical traceback on the server, not to the client.
         logger.exception("Database error while placing order")
         raise HTTPException(
             status_code=500,
-            detail="Database error while placing order.",
+            detail="A database error occurred while placing the order.",
         ) from exc
 
     except Exception as exc:
-        # Capture unexpected application errors for diagnosis.
         logger.exception("Unexpected error while placing order")
         raise HTTPException(
             status_code=500,
-            detail="Unexpected error while placing order. Check server logs.",
+            detail="An unexpected error occurred while placing the order.",
         ) from exc
 
     # 4. Return the saved order.
