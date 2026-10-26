@@ -2,12 +2,15 @@
 from fastapi import FastAPI, HTTPException
 
 from app.database import get_connection
+from app.routes.stocks import router as stocks_router
 
 app = FastAPI(
     title="Trading System API",
     description="A simulated stock trading and portfolio management API.",
     version="1.0.0",
 )
+
+app.include_router(stocks_router)
 
 
 @app.get("/health")
