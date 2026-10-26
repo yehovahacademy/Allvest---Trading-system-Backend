@@ -56,15 +56,15 @@ def get_market_quote(symbol: str) -> StockQuote:
     if "Note" in data:
         print("Alpha Vantage rate limit notice:", data["Note"])
         raise HTTPException(
-            status_code=429,
-            detail="Market data provider rate limit exceeded.",
+             status_code=503,
+        detail="Alpha Vantage rate limit reached. Check Render logs."
         )
 
     if "Information" in data:
         print("Alpha Vantage unexpected response structure:", data["Information"])
         raise HTTPException(
-            status_code=502,
-            detail="Market data provider returned unexpected information.",
+            status_code=503,
+        detail="Alpha Vantage returned an API restriction or information message. Check Render logs."
         )
         
     
