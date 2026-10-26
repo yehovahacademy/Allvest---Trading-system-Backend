@@ -25,6 +25,7 @@ def get_market_quote(symbol: str) -> StockQuote:
         )
         response.raise_for_status()
         data = response.json()
+        print("Alpha Vantage response:", data)
 
     except httpx.TimeoutException:
         raise HTTPException(
