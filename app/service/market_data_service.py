@@ -1,5 +1,6 @@
 
-from datetime import date
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import httpx
 from fastapi import HTTPException
@@ -11,92 +12,99 @@ from app.schemas.stock_schemas import StockQuote
 def get_market_quote(symbol: str) -> StockQuote:
     symbol = symbol.strip().upper()
 
-    params = {
-        "function": "GLOBAL_QUOTE",
-        "symbol": symbol,
-        "apikey": settings.alpha_vantage_api_key,
-    }
+    if not symbol:
+        raise HTTPException(
+            status_code=400,
+            detail="Stock symbol is required.",
+        )
 
     try:
         response = httpx.get(
-            "https://www.alphavantage.co/query",
-            params=params,
+            "https://api.twelvedata.com/quote",
+            params={
+                "symbol": symbol,
+                "apikey": settings.twelve_data_api_key,
+            },
             timeout=10.0,
         )
         response.raise_for_status()
         data = response.json()
-        print("Alpha Vantage response:", data)
 
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=504,
             detail="Market data provider timed out.",
         )
-
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            raise HTTPException(
+                status_code=503,
+                detail="Market data provider rate limit reached.",
+            )
+        raise HTTPException(
+            status_code=502,
+            detail="Market data provider returned an HTTP error.",
+        )
     except httpx.HTTPError:
         raise HTTPException(
             status_code=502,
-            detail="Unable to retrieve market data.",
+            detail="Unable to contact market data provider.",
         )
-
     except ValueError:
         raise HTTPException(
             status_code=502,
             detail="Market data provider returned invalid JSON.",
         )
 
-    # Alpha Vantage may return API errors or rate-limit messages
-    # even when the HTTP response status is 200.
-    if "Error Message" in data:
+    if not isinstance(data, dict):
         raise HTTPException(
             status_code=502,
-            detail="Market data provider rejected the request.",
+            detail="Invalid market data response.",
         )
 
-    if "Note" in data:
-        print("Alpha Vantage rate limit notice:", data["Note"])
+    if "code" in data and "message" in data:
+        code = str(data.get("code"))
+        if code == "429":
+            raise HTTPException(
+                status_code=503,
+                detail="Market data provider rate limit reached.",
+            )
+        if code in ("401", "403"):
+            raise HTTPException(
+                status_code=502,
+                detail="Market data API key or plan does not permit this request.",
+            )
         raise HTTPException(
-             status_code=503,
-        detail="Alpha Vantage rate limit reached. Check Render logs."
-        )
-
-    if "Information" in data:
-        print("Alpha Vantage unexpected response structure:", data["Information"])
-        raise HTTPException(
-            status_code=503,
-        detail="Alpha Vantage returned an API restriction or information message. Check Render logs."
-        )
-        
-    
-    quote_data = data.get("Global Quote", {})
-
-    if not quote_data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No quote available for symbol {symbol}.",
+            status_code=502,
+            detail="Market data provider could not return this quote.",
         )
 
     try:
-        quote_symbol = quote_data["01. symbol"].strip().upper()
-        price = float(quote_data["05. price"])
-        trading_day = date.fromisoformat(
-            quote_data["07. latest trading day"]
+        price = Decimal(str(data["close"]))
+        trading_day = date.fromisoformat(data["datetime"])
+        timestamp = datetime.fromtimestamp(
+            int(data["timestamp"]),
+            tz=timezone.utc,
         )
 
-        if price <= 0:
-            raise ValueError("Price must be positive.")
+        if not price.is_finite() or price <= 0:
+            raise ValueError("Invalid price")
 
-    except (KeyError, TypeError, ValueError):
+        if timestamp > datetime.now(timezone.utc):
+            raise ValueError("Future quote timestamp")
+
+    except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError):
         raise HTTPException(
             status_code=502,
-            detail="Market data provider returned an invalid quote.",
+            detail="Market data provider returned an invalid or incomplete quote.",
         )
 
     return StockQuote(
-        symbol=quote_symbol,
-        price=price,
+        symbol=symbol,
+        price=float(price),
         latest_trading_day=trading_day,
-        currency="USD",
-        data_source="Alpha Vantage",
+        quote_timestamp=timestamp,
+        currency=data.get("currency", "USD"),
+        data_source="Twelve Data",
         data_status="UNVERIFIED",
     )

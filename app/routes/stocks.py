@@ -1,5 +1,5 @@
 from app.service.stocks_service import get_stocks
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from app.service.market_data_service import get_market_quote
 from app.schemas.stock_schemas import StockQuote
 

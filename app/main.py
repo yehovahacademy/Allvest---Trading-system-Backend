@@ -5,6 +5,8 @@ from app.database import get_connection
 from app.routes.stocks import router as stocks_router
 from app.routes.stocks import router as stocks_quotes
 
+from app.routes.order import router as orders_router
+
 app = FastAPI(
     title="Trading System API",
     description="A simulated stock trading and portfolio management API.",
@@ -13,6 +15,7 @@ app = FastAPI(
 
 app.include_router(stocks_router)
 app.include_router(stocks_quotes)
+app.include_router(orders_router)
 
 @app.get("/health")
 def health_check():
