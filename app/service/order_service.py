@@ -1,23 +1,26 @@
 
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import psycopg
 from fastapi import HTTPException
 
 from app.database import get_connection
 from app.schemas.order_schemas import OrderCreate
 from app.service.market_data_service import get_market_quote
 
+logger = logging.getLogger(__name__)
+
 
 def place_order(order: OrderCreate):
     symbol = order.symbol.strip().upper()
     quantity = order.quantity
 
-    # 1. Retrieve a quote from Twelve Data.
-    # Preserve the provider's meaningful HTTP error.
+    # 1. Retrieve a market quote.
     quote = get_market_quote(symbol)
 
-    # 2. Validate quote timestamp.
+    # 2. Validate the quote timestamp.
     now = datetime.now(timezone.utc)
     quote_timestamp = quote.quote_timestamp
 
@@ -34,7 +37,6 @@ def place_order(order: OrderCreate):
         )
 
     # Demo policy: reject quotes older than seven days.
-    # This does not guarantee that a quote is live or current.
     if now - quote_timestamp > timedelta(days=7):
         raise HTTPException(
             status_code=503,
@@ -49,142 +51,166 @@ def place_order(order: OrderCreate):
             detail="Order rejected: invalid market price.",
         )
 
-    # 3. Validate the user, stock, and holdings and update
-    # the order and portfolio in one database transaction.
-    with get_connection() as conn:
-        with conn.cursor() as cur:
+    try:
+        # 3. Perform order and portfolio changes in one transaction.
+        with get_connection() as conn:
+            with conn.cursor() as cur:
 
-            # Validate user.
-            cur.execute(
-                "SELECT id FROM users WHERE id = %s",
-                (order.user_id,),
-            )
-            if cur.fetchone() is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="User not found.",
+                # Validate user.
+                cur.execute(
+                    "SELECT id FROM users WHERE id = %s",
+                    (order.user_id,),
                 )
-
-            # Validate stock exists in our reference catalogue.
-            cur.execute(
-                """
-                SELECT symbol
-                FROM stock_reference_data
-                WHERE symbol = %s
-                """,
-                (symbol,),
-            )
-            if cur.fetchone() is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Stock not found.",
-                )
-
-            # Lock an existing holding before checking a SELL.
-            cur.execute(
-                """
-                SELECT quantity, average_buy_price
-                FROM portfolio_holdings
-                WHERE user_id = %s AND symbol = %s
-                FOR UPDATE
-                """,
-                (order.user_id, symbol),
-            )
-            holding = cur.fetchone()
-
-            if order.side == "SELL":
-                available_quantity = (
-                    Decimal(str(holding[0]))
-                    if holding is not None
-                    else Decimal("0")
-                )
-
-                if available_quantity < quantity:
+                if cur.fetchone() is None:
                     raise HTTPException(
-                        status_code=400,
-                        detail="Insufficient shares to sell.",
+                        status_code=404,
+                        detail="User not found.",
                     )
 
-            # Insert the simulated order.
-            cur.execute(
-                """
-                INSERT INTO orders
-                    (user_id, symbol, side, quantity, price, status)
-                VALUES (%s, %s, %s, %s, %s, 'FILLED')
-                RETURNING id, user_id, symbol, side, quantity, price,
-                          status, created_at
-                """,
-                (
-                    order.user_id,
-                    symbol,
-                    order.side,
-                    quantity,
-                    price,
-                ),
-            )
-            saved_order = cur.fetchone()
-
-            if order.side == "BUY":
-                old_quantity = (
-                    Decimal(str(holding[0]))
-                    if holding is not None
-                    else Decimal("0")
-                )
-                old_average = (
-                    Decimal(str(holding[1]))
-                    if holding is not None
-                    else Decimal("0")
-                )
-
-                new_quantity = old_quantity + quantity
-
-                new_average = (
-                    old_quantity * old_average + quantity * price
-                ) / new_quantity
-
+                # Validate stock catalogue entry.
                 cur.execute(
                     """
-                    INSERT INTO portfolio_holdings
-                        (user_id, symbol, quantity, average_buy_price)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (user_id, symbol)
-                    DO UPDATE SET
-                        quantity = EXCLUDED.quantity,
-                        average_buy_price = EXCLUDED.average_buy_price,
-                        updated_at = NOW()
+                    SELECT symbol
+                    FROM stock_reference_data
+                    WHERE symbol = %s
                     """,
-                    (
-                        order.user_id,
-                        symbol,
-                        new_quantity,
-                        new_average,
-                    ),
+                    (symbol,),
                 )
+                if cur.fetchone() is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Stock not found.",
+                    )
 
-            else:
-                old_quantity = Decimal(str(holding[0]))
-                old_average = Decimal(str(holding[1]))
-                remaining = old_quantity - quantity
-
+                # Retrieve and lock an existing holding.
                 cur.execute(
                     """
-                    UPDATE portfolio_holdings
-                    SET quantity = %s,
-                        average_buy_price = %s,
-                        updated_at = NOW()
+                    SELECT quantity, average_buy_price
+                    FROM portfolio_holdings
                     WHERE user_id = %s AND symbol = %s
+                    FOR UPDATE
+                    """,
+                    (order.user_id, symbol),
+                )
+                holding = cur.fetchone()
+
+                # Prevent selling shares the user does not own.
+                if order.side == "SELL":
+                    available_quantity = (
+                        Decimal(str(holding[0]))
+                        if holding is not None
+                        else Decimal("0")
+                    )
+
+                    if available_quantity < quantity:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Insufficient shares to sell.",
+                        )
+
+                # Insert simulated order.
+                cur.execute(
+                    """
+                    INSERT INTO orders
+                        (user_id, symbol, side, quantity, price, status)
+                    VALUES (%s, %s, %s, %s, %s, 'FILLED')
+                    RETURNING
+                        id, user_id, symbol, side, quantity, price,
+                        status, created_at
                     """,
                     (
-                        remaining,
-                        old_average if remaining > 0 else Decimal("0"),
                         order.user_id,
                         symbol,
+                        order.side,
+                        quantity,
+                        price,
                     ),
                 )
+                saved_order = cur.fetchone()
 
-        # Commit both order and holding changes together.
-        conn.commit()
+                if order.side == "BUY":
+                    old_quantity = (
+                        Decimal(str(holding[0]))
+                        if holding is not None
+                        else Decimal("0")
+                    )
+                    old_average = (
+                        Decimal(str(holding[1]))
+                        if holding is not None
+                        else Decimal("0")
+                    )
 
+                    new_quantity = old_quantity + quantity
+
+                    # Calculate weighted average purchase price.
+                    new_average = (
+                        old_quantity * old_average + quantity * price
+                    ) / new_quantity
+
+                    cur.execute(
+                        """
+                        INSERT INTO portfolio_holdings
+                            (user_id, symbol, quantity, average_buy_price)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (user_id, symbol)
+                        DO UPDATE SET
+                            quantity = EXCLUDED.quantity,
+                            average_buy_price = EXCLUDED.average_buy_price,
+                            updated_at = NOW()
+                        """,
+                        (
+                            order.user_id,
+                            symbol,
+                            new_quantity,
+                            new_average,
+                        ),
+                    )
+
+                else:
+                    old_quantity = Decimal(str(holding[0]))
+                    old_average = Decimal(str(holding[1]))
+                    remaining = old_quantity - quantity
+
+                    cur.execute(
+                        """
+                        UPDATE portfolio_holdings
+                        SET quantity = %s,
+                            average_buy_price = %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s AND symbol = %s
+                        """,
+                        (
+                            remaining,
+                            old_average if remaining > 0 else Decimal("0"),
+                            order.user_id,
+                            symbol,
+                        ),
+                    )
+
+            # Commit order and portfolio changes together.
+            conn.commit()
+
+    except HTTPException:
+        # Preserve expected errors such as 404 and 400.
+        raise
+
+    except psycopg.Error as exc:
+        # Log the technical traceback on the server, not to the client.
+        logger.exception("Database error while placing order")
+        raise HTTPException(
+            status_code=500,
+            detail="Database error while placing order.",
+        ) from exc
+
+    except Exception as exc:
+        # Capture unexpected application errors for diagnosis.
+        logger.exception("Unexpected error while placing order")
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected error while placing order. Check server logs.",
+        ) from exc
+
+    # 4. Return the saved order.
     return {
         "id": saved_order[0],
         "user_id": saved_order[1],
