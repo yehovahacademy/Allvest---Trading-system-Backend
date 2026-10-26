@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException
 
 from app.database import get_connection
 from app.routes.stocks import router as stocks_router
+from app.routes.stocks import router as stocks_quotes
 
 app = FastAPI(
     title="Trading System API",
@@ -11,7 +12,7 @@ app = FastAPI(
 )
 
 app.include_router(stocks_router)
-
+app.include_router(stocks_quotes)
 
 @app.get("/health")
 def health_check():

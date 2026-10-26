@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from datetime import datetime
+from pydantic import BaseModel, Field
+from datetime import date, datetime
 
 class Stock(BaseModel):
   symbol: str
@@ -12,11 +12,11 @@ class Stock(BaseModel):
   data_source: str
   data_status: str
 
+
 class StockQuote(BaseModel):
-  symbol: str
-  price: float
-  timestamp: datetime  
-  currency: str
-  data_source: str
-  data_status: str
-  
+    symbol: str
+    price: float = Field(gt=0)
+    latest_trading_day: date
+    currency: str
+    data_source: str
+    data_status: str
